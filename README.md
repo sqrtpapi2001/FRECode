@@ -154,6 +154,7 @@ FRECode writes a NEXUS file to standard output.
 
 Example (column-wise mode):
 
+```text 
 #NEXUS
 BEGIN DATA;
     DIMENSIONS NTAX=5 NCHAR=12;
@@ -170,9 +171,9 @@ END;
 BEGIN ASSUMPTIONS;
     TYPESET * UNTITLED   =  ord:  1- 12;
 END;
+```
 
-
-This is directly usable in:
+## This is directly usable in:
 
 PAUP*
 
