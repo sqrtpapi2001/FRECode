@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
 """
-Recode aligned DNA sequences into a 0–3 STANDARD NEXUS matrix
-according to the procedure in To_John_Franco.txt:
+FRECode: Frequency-based Recoder for DNA Alignments
 
-Part 1 (global mode):
-    - Count A, C, G, T over the entire matrix (ignoring '?').
-    - Assign weights 1, 2, 4, 8 so that the most frequent nucleotide
-      gets weight 1, next 2, next 4, least frequent 8 (minimizes sum).
-    - Map 1 -> 0, 2 -> 1, 4 -> 2, 8 -> 3 to get the final symbols 0–3.
-    - Use that same mapping for all sites.
+Implements the procedure described in the To_John_Franco.txt note:
 
-Part 2 (column mode):
-    - Do the *same* procedure independently for each column:
-        * count A, C, G, T in that column (ignoring '?'),
-        * assign 1,2,4,8 by frequency as above,
-        * map to 0–3 column-specifically.
-    - Thus each column can have its own code mapping.
+- Global mode:
+    * Count A, C, G, T over the entire alignment (ignoring '?' and '-').
+    * Rank nucleotides by decreasing frequency (ties -> alphabetical).
+    * Assign weights 1, 2, 4, 8 in that order.
+    * Map weights to codes via: 1->0, 2->1, 4->2, 8->3.
+    * Apply the same nuc->code mapping to all sites.
 
-Usage examples (from the shell):
+- Column mode:
+    * Do the same ranking/weighting independently for each column.
+    * Each column has its own nuc->code mapping based on column frequencies.
 
-    python recode_alignment.py input.txt --mode global      > output_global.nex
-    python recode_alignment.py input.txt --mode column      > output_column.nex
-    python recode_alignment.py input.txt --mode global --add-outgroup > with_outgroup.nex
+- Both mode:
+    * Output both the global and column-wise recodings in one NEXUS file:
+      first the global DATA block, then the column-wise DATA block.
+
+Input format:
+
+    <NTAX> <NCHAR>
+    <TaxonName> <Sequence>
+    <TaxonName> <Sequence>
+    ...
+
+Example:
+
+    5 12
+    Tax1   ACGTACGTACGT
+    Tax2   A?GTACCTACGA
+    Tax3   TCGTACGTACGA
+    Tax4   ACGTACGTTCGT
+    Tax5   GCGTACGTACGA
 """
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Dict, List, Tuple
 
 
@@ -43,21 +55,23 @@ def parse_alignment(path: str) -> Tuple[Dict[str, str], int, int]:
         <taxon_name><whitespace><sequence>
         ...
 
-    - First non-empty, non-comment line: two integers.
-    - Next <ntax> non-empty, non-comment lines: taxon + sequence.
+    - First non-empty, non-comment line: two integers (ntax, nchar).
+    - Next ntax non-empty, non-comment lines: taxon + sequence.
       Taxon name is taken as the first field; sequence as the last field.
     """
     alignment: Dict[str, str] = {}
 
     with open(path, "r", encoding="utf-8") as f:
-        # Read first non-empty, non-comment line for ntax, nchar
+        # Get ntax, nchar from the first non-empty, non-comment line
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
             if len(parts) < 2:
-                raise ValueError("First non-empty line must contain NTAX and NCHAR.")
+                raise ValueError(
+                    "First non-empty line must contain NTAX and NCHAR."
+                )
             ntax_declared = int(parts[0])
             nchar_declared = int(parts[1])
             break
@@ -66,10 +80,10 @@ def parse_alignment(path: str) -> Tuple[Dict[str, str], int, int]:
 
         # Read taxon lines
         for line in f:
-            line = line.rstrip("\n")
-            if not line.strip() or line.strip().startswith("#"):
+            raw = line.rstrip("\n")
+            if not raw.strip() or raw.strip().startswith("#"):
                 continue
-            parts = line.split()
+            parts = raw.split()
             if len(parts) < 2:
                 continue
             taxon = parts[0]
@@ -108,7 +122,7 @@ def compute_global_mapping(alignment: Dict[str, str]) -> Dict[str, int]:
             if ch in NUCS:
                 total_counts[ch] += 1
 
-    # If some nucleotides are absent, keep them with count 0 for determinism
+    # Ensure all four nucleotides are present so the mapping is deterministic
     for n in NUCS:
         total_counts.setdefault(n, 0)
 
@@ -133,7 +147,6 @@ def compute_column_mappings(
 
     Returns list of length nchar, where each element is a dict nuc->code.
     """
-    # Initialize per-column counters
     col_counts: List[Counter] = [Counter() for _ in range(nchar)]
 
     for seq in alignment.values():
@@ -147,7 +160,6 @@ def compute_column_mappings(
     for j in range(nchar):
         counts = col_counts[j]
 
-        # Ensure all four nucleotides are present (with count 0 if truly absent)
         for n in NUCS:
             counts.setdefault(n, 0)
 
@@ -167,7 +179,7 @@ def encode_alignment_global(
 ) -> Dict[str, str]:
     """
     Apply a single global mapping nuc->code to every position.
-    '?' and '-' are left as-is.
+    '?' and '-' are left as-is; unknown symbols become '?'.
     """
     encoded: Dict[str, str] = {}
 
@@ -180,7 +192,6 @@ def encode_alignment_global(
             elif ch in ("?", "-"):
                 out_chars.append(ch)
             else:
-                # Treat unknown/ambiguous as missing
                 out_chars.append("?")
         encoded[taxon] = "".join(out_chars)
 
@@ -193,7 +204,7 @@ def encode_alignment_columnwise(
     """
     Apply column-specific mappings.
     col_mappings[j] is a dict nuc->code for column j.
-    '?' and '-' are left as-is.
+    '?' and '-' are left as-is; unknown symbols become '?'.
     """
     encoded: Dict[str, str] = {}
     nchar = len(col_mappings)
@@ -223,38 +234,40 @@ def format_nexus_matrix(
     encoded: Dict[str, str],
     add_outgroup: bool = False,
     outgroup_name: str = "Out",
+    include_header: bool = True,
 ) -> str:
     """
-    Return the NEXUS MATRIX block as a string.
+    Return a NEXUS DATA block (plus ASSUMPTIONS) as a string.
 
     If add_outgroup is True, append an 'Out' taxon coded as all zeros.
-    (Useful if you want to replicate the example output exactly.)
+    If include_header is True, add the '#NEXUS' line at the top.
     """
     taxa = list(encoded.keys())
     nchar = len(next(iter(encoded.values())))
     ntax = len(taxa)
 
     lines: List[str] = []
-    lines.append("#NEXUS")
+    if include_header:
+        lines.append("#NEXUS")
     lines.append("BEGIN DATA;")
-    lines.append(f"    DIMENSIONS NTAX={ntax + (1 if add_outgroup else 0)} NCHAR={nchar};")
+    lines.append(
+        f"    DIMENSIONS NTAX={ntax + (1 if add_outgroup else 0)} "
+        f"NCHAR={nchar};"
+    )
     lines.append(
         '    FORMAT DATATYPE=STANDARD MISSING=? GAP=- SYMBOLS="0123";'
     )
     lines.append("    MATRIX")
 
-    # Determine width for taxon name column
     max_name_len = max(len(t) for t in taxa + ([outgroup_name] if add_outgroup else []))
-    name_field = max_name_len + 2  # a bit of spacing
+    name_field = max_name_len + 2
 
     for t in taxa:
         seq = encoded[t]
         lines.append(f"    {t.ljust(name_field)}{seq}")
 
     if add_outgroup:
-        lines.append(
-            f"    {outgroup_name.ljust(name_field)}" + ("0" * nchar)
-        )
+        lines.append(f"    {outgroup_name.ljust(name_field)}" + ("0" * nchar))
 
     lines.append("    ;")
     lines.append("END;")
@@ -268,24 +281,27 @@ def format_nexus_matrix(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Recode nucleotide alignment into NEXUS 0–3 matrix "
-        "using a global or per-column frequency-based mapping."
+        description=(
+            "FRECode: recode nucleotide alignments into 0–3 NEXUS matrices "
+            "using global or column-wise frequency-based mappings."
+        )
     )
     parser.add_argument("input", help="Path to input alignment text file.")
     parser.add_argument(
         "--mode",
-        choices=["global", "column"],
+        choices=["global", "column", "both"],
         default="global",
         help=(
             "Recoding mode:\n"
-            "  global  – use a single mapping for all sites (Part 1).\n"
-            "  column  – compute mapping independently for each column (Part 2)."
+            "  global  – use a single mapping for all sites.\n"
+            "  column  – compute mapping independently for each column.\n"
+            "  both    – output both global and column-wise recodings."
         ),
     )
     parser.add_argument(
         "--add-outgroup",
         action="store_true",
-        help="If set, add an 'Out' taxon with all zeros as in the example.",
+        help="If set, add an 'Out' taxon with all zeros.",
     )
 
     args = parser.parse_args()
@@ -295,12 +311,49 @@ def main() -> None:
     if args.mode == "global":
         mapping = compute_global_mapping(alignment)
         encoded = encode_alignment_global(alignment, mapping)
-    else:  # column-wise
+        nexus_text = format_nexus_matrix(
+            encoded,
+            add_outgroup=args.add_outgroup,
+            include_header=True,
+        )
+        print(nexus_text)
+
+    elif args.mode == "column":
         col_mappings = compute_column_mappings(alignment, nchar)
         encoded = encode_alignment_columnwise(alignment, col_mappings)
+        nexus_text = format_nexus_matrix(
+            encoded,
+            add_outgroup=args.add_outgroup,
+            include_header=True,
+        )
+        print(nexus_text)
 
-    nexus_text = format_nexus_matrix(encoded, add_outgroup=args.add_outgroup)
-    print(nexus_text)
+    elif args.mode == "both":
+        # Global recoding
+        mapping = compute_global_mapping(alignment)
+        encoded_global = encode_alignment_global(alignment, mapping)
+        nexus_global = format_nexus_matrix(
+            encoded_global,
+            add_outgroup=args.add_outgroup,
+            include_header=True,
+        )
+
+        # Column-wise recoding
+        col_mappings = compute_column_mappings(alignment, nchar)
+        encoded_col = encode_alignment_columnwise(alignment, col_mappings)
+        # No second #NEXUS header
+        nexus_col = format_nexus_matrix(
+            encoded_col,
+            add_outgroup=args.add_outgroup,
+            include_header=False,
+        )
+
+        # Output both blocks, separated by NEXUS comments
+        print("[FRECode GLOBAL recoding]")
+        print(nexus_global)
+        print("")
+        print("[FRECode COLUMN-WISE recoding]")
+        print(nexus_col)
 
 
 if __name__ == "__main__":
