@@ -74,27 +74,27 @@ Usage
 
 Basic usage:
 
-python frecode.py input.txt --mode global
+```python frecode.py input.txt --mode global```
 
-python frecode.py input.txt --mode column
+```python frecode.py input.txt --mode column```
 
 
 Redirect output to a file:
 
-python frecode.py input.txt --mode column > recoded.nex
+```python frecode.py input.txt --mode column > recoded.nex```
 
 
 Add an all-zero synthetic outgroup (named Out by default):
 
-python frecode.py input.txt --mode global --add-outgroup > recoded_with_outgroup.nex
+```python frecode.py input.txt --mode global --add-outgroup > recoded_with_outgroup.nex```
 
-Command-line options
+Command-line options:
 
-input (positional) – path to the alignment .txt file
+``input (positional)``` – path to the alignment .txt file
 
---mode {global,column} – recoding mode (default: global)
+```--mode {global,column}``` – recoding mode (default: global)
 
---add-outgroup – append an all-zero outgroup taxon to the matrix
+```--add-outgroup``` – append an all-zero outgroup taxon to the matrix
 
 Recoding Method
 1. Frequency counting
