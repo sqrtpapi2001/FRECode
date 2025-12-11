@@ -44,10 +44,11 @@ FRECode expects a plain-text file with this structure:
 <NTAX> <NCHAR>
 <TaxonName> <Sequence>
 <TaxonName> <Sequence>
-...
+```
 
 where
 
+```text
 NTAX = number of taxa (sequences)
 
 NCHAR = alignment length (characters per sequence)
@@ -57,14 +58,17 @@ Taxon names must be single tokens (no spaces)
 All sequences must be exactly NCHAR long
 
 Valid sequence characters: A C G T ? -
+```
 
 ## Example
+```text
 5 12
 Tax1   ACGTACGTACGT
 Tax2   A?GTACCTACGA
 Tax3   TCGTACGTACGA
 Tax4   ACGTACGTTCGT
 Tax5   GCGTACGTACGA
+```
 
 Usage
 
