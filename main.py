@@ -1,44 +1,36 @@
 #!/usr/bin/env python3
 """
 FRECode: Frequency-based Recoder for DNA Alignments
+Now supports:
+  - PHYLIP (.phy) input (sequential or interleaved; wrapped lines supported)
+  - Simple TXT input (ntax nchar + taxon seq)
+  - Recoding modes: global | column | both
+  - Output: NEXUS
+  - Optional ZIP packaging of output files
 
-Implements the procedure described in the To_John_Franco.txt note:
+Examples
+--------
+# Column-wise recoding from PHYLIP, zip output:
+python frecode.py Test_1.phy --mode column --zip FRECode_output.zip
 
-- Global mode:
-    * Count A, C, G, T over the entire alignment (ignoring '?' and '-').
-    * Rank nucleotides by decreasing frequency (ties -> alphabetical).
-    * Assign weights 1, 2, 4, 8 in that order.
-    * Map weights to codes via: 1->0, 2->1, 4->2, 8->3.
-    * Apply the same nuc->code mapping to all sites.
+# Global recoding from PHYLIP:
+python frecode.py Test_1.phy --mode global > out.nex
 
-- Column mode:
-    * Do the same ranking/weighting independently for each column.
-    * Each column has its own nuc->code mapping based on column frequencies.
+# Both recodings, write to files and zip them:
+python frecode.py Test_1.phy --mode both --out-prefix Test_1 --zip Test_1_frecode.zip
 
-- Both mode:
-    * Output both the global and column-wise recodings in one NEXUS file:
-      first the global DATA block, then the column-wise DATA block.
-
-Input format:
-
-    <NTAX> <NCHAR>
-    <TaxonName> <Sequence>
-    <TaxonName> <Sequence>
-    ...
-
-Example:
-
-    5 12
-    Tax1   ACGTACGTACGT
-    Tax2   A?GTACCTACGA
-    Tax3   TCGTACGTACGA
-    Tax4   ACGTACGTTCGT
-    Tax5   GCGTACGTACGA
+# Simple TXT format:
+python frecode.py alignment.txt --mode column --zip out.zip
 """
 
+from __future__ import annotations
+
 import argparse
+import zipfile
 from collections import Counter
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
 
 NUCS = ("A", "C", "G", "T")
@@ -46,314 +38,414 @@ WEIGHTS = [1, 2, 4, 8]
 WEIGHT_TO_CODE = {1: 0, 2: 1, 4: 2, 8: 3}
 
 
-def parse_alignment(path: str) -> Tuple[Dict[str, str], int, int]:
-    """
-    Parse a simple alignment text file.
+@dataclass
+class Alignment:
+    taxa: List[str]              # ordered taxa
+    seqs: Dict[str, str]         # taxon -> sequence
+    nchar: int
 
-    Expected format:
-        <ntax> <nchar>
-        <taxon_name><whitespace><sequence>
+
+def _clean_seq(s: str) -> str:
+    return "".join(ch for ch in s.replace(" ", "").replace("\t", "") if ch)
+
+
+def read_txt_alignment(path: Path) -> Alignment:
+    """
+    Read the simple TXT format:
+
+        <NTAX> <NCHAR>
+        <TaxonName> <Sequence>
         ...
 
-    - First non-empty, non-comment line: two integers (ntax, nchar).
-    - Next ntax non-empty, non-comment lines: taxon + sequence.
-      Taxon name is taken as the first field; sequence as the last field.
+    - First non-empty, non-comment line gives ntax and nchar.
+    - Next ntax non-empty, non-comment lines provide taxon and sequence.
+      First token = taxon, last token = sequence.
     """
-    alignment: Dict[str, str] = {}
-
-    with open(path, "r", encoding="utf-8") as f:
-        # Get ntax, nchar from the first non-empty, non-comment line
+    lines: List[str] = []
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
+            s = line.strip()
+            if not s or s.startswith("#"):
                 continue
+            lines.append(line.rstrip("\n"))
+
+    if not lines:
+        raise ValueError("Empty alignment file.")
+
+    ntax, nchar = map(int, lines[0].split()[:2])
+    taxa: List[str] = []
+    seqs: Dict[str, str] = {}
+
+    for line in lines[1:]:
+        if len(taxa) >= ntax:
+            break
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        taxon = parts[0]
+        seq = parts[-1].strip()
+        seqs[taxon] = seq
+        taxa.append(taxon)
+
+    if len(taxa) != ntax:
+        raise ValueError(f"Declared NTAX={ntax}, but read {len(taxa)} sequences.")
+
+    for t in taxa:
+        if len(seqs[t]) != nchar:
+            raise ValueError(f"Sequence length mismatch for {t}: expected {nchar}, got {len(seqs[t])}.")
+
+    return Alignment(taxa=taxa, seqs=seqs, nchar=nchar)
+
+
+def read_phylip(path: Path) -> Alignment:
+    """
+    Robust PHYLIP reader:
+      - Handles sequential and interleaved PHYLIP
+      - Handles wrapped lines
+      - Assumes taxon name is the first field (often fixed-width 10 chars, but we accept relaxed)
+      - For interleaved: after first block, subsequent blocks may omit taxon names
+
+    Strategy:
+      1) Read header NTAX NCHAR
+      2) Parse first block of up to NTAX taxa lines with names and initial sequence chunks
+      3) Then keep reading sequence chunks (interleaved or sequential-wrapped) until each taxon reaches NCHAR
+    """
+    raw_lines: List[str] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                raw_lines.append(line.rstrip("\n"))
+
+    if not raw_lines:
+        raise ValueError("Empty PHYLIP file.")
+
+    header = raw_lines[0].split()
+    if len(header) < 2:
+        raise ValueError("PHYLIP header must begin with: <NTAX> <NCHAR>")
+
+    ntax, nchar = int(header[0]), int(header[1])
+    body = raw_lines[1:]
+
+    taxa: List[str] = []
+    seqs: Dict[str, str] = {}
+
+    i = 0
+
+    # ---- Parse first block: expect NTAX taxa lines with names + sequence chunk
+    while i < len(body) and len(taxa) < ntax:
+        line = body[i]
+        i += 1
+        if not line.strip():
+            continue
+
+        # Common PHYLIP: name is first 10 chars; relaxed PHYLIP: name is first token
+        # We try fixed-width first; if that yields empty, fall back to token.
+        name_fw = line[:10].strip()
+        rest_fw = line[10:]
+        if name_fw:
+            name = name_fw
+            chunk = _clean_seq(rest_fw)
+        else:
             parts = line.split()
             if len(parts) < 2:
-                raise ValueError(
-                    "First non-empty line must contain NTAX and NCHAR."
-                )
-            ntax_declared = int(parts[0])
-            nchar_declared = int(parts[1])
-            break
-        else:
-            raise ValueError("Empty file or no valid NTAX/NCHAR line found.")
-
-        # Read taxon lines
-        for line in f:
-            raw = line.rstrip("\n")
-            if not raw.strip() or raw.strip().startswith("#"):
                 continue
-            parts = raw.split()
-            if len(parts) < 2:
-                continue
-            taxon = parts[0]
-            seq = parts[-1].strip()
-            alignment[taxon] = seq
+            name = parts[0]
+            chunk = _clean_seq("".join(parts[1:]))
 
-    ntax_actual = len(alignment)
-    if ntax_actual != ntax_declared:
-        raise ValueError(
-            f"Declared NTAX={ntax_declared}, but read {ntax_actual} sequences."
-        )
+        taxa.append(name)
+        seqs[name] = chunk
 
-    for taxon, seq in alignment.items():
-        if len(seq) != nchar_declared:
+    if len(taxa) != ntax:
+        raise ValueError(f"PHYLIP header says NTAX={ntax}, but could not parse {ntax} taxon lines.")
+
+    # ---- Now collect remaining sequence chunks until each taxon reaches nchar
+    def done() -> bool:
+        return all(len(seqs[t]) >= nchar for t in taxa)
+
+    # Decide whether remaining looks interleaved (blocks of NTAX lines) or sequential-wrapped.
+    # We'll handle either by two passes:
+    # - If a line begins with a known taxon name (or fixed-width name), treat as named line.
+    # - Else, treat as unnamed chunk line for taxa in order (interleaved blocks).
+
+    while i < len(body) and not done():
+        # Skip blank separators
+        if not body[i].strip():
+            i += 1
+            continue
+
+        # Peek next non-empty line
+        line = body[i]
+
+        # Try interpret as named line (interleaved blocks that repeat taxon names)
+        name_fw = line[:10].strip()
+        parts = line.split()
+        named = False
+        name = None
+        chunk = ""
+
+        if name_fw in seqs:
+            named = True
+            name = name_fw
+            chunk = _clean_seq(line[10:])
+        elif parts and parts[0] in seqs:
+            named = True
+            name = parts[0]
+            chunk = _clean_seq("".join(parts[1:]))
+
+        if named:
+            # Consume named lines as they appear
+            i += 1
+            seqs[name] += chunk
+            continue
+
+        # Otherwise, assume an unnamed interleaved block: next NTAX lines are chunks (possibly with whitespace)
+        for t in taxa:
+            # advance to next non-empty
+            while i < len(body) and not body[i].strip():
+                i += 1
+            if i >= len(body):
+                break
+            chunk_line = body[i]
+            i += 1
+            seqs[t] += _clean_seq(chunk_line)
+
+    # Trim sequences to nchar and validate
+    for t in taxa:
+        seqs[t] = seqs[t][:nchar]
+        if len(seqs[t]) != nchar:
             raise ValueError(
-                f"Sequence length mismatch for {taxon}: "
-                f"expected {nchar_declared}, got {len(seq)}."
+                f"PHYLIP parse incomplete for {t}: expected {nchar} characters, got {len(seqs[t])}."
             )
 
-    return alignment, ntax_declared, nchar_declared
+    return Alignment(taxa=taxa, seqs=seqs, nchar=nchar)
 
 
-def compute_global_mapping(alignment: Dict[str, str]) -> Dict[str, int]:
-    """
-    Count A/C/G/T over the entire alignment (ignoring '?' and '-')
-    and produce a nucleotide -> {0,1,2,3} mapping using:
+def read_alignment_auto(path: Path) -> Alignment:
+    ext = path.suffix.lower()
+    if ext in (".phy", ".phylip"):
+        return read_phylip(path)
+    # fallback: try txt format
+    return read_txt_alignment(path)
 
-        - sort by decreasing frequency (ties -> alphabetical),
-        - assign weights [1,2,4,8] in that order,
-        - map weights to 0–3 via WEIGHT_TO_CODE.
-    """
-    total_counts = Counter()
-    for seq in alignment.values():
+
+def compute_global_mapping(aln: Alignment) -> Dict[str, int]:
+    total = Counter()
+    for seq in aln.seqs.values():
         for ch in seq:
-            ch = ch.upper()
-            if ch in NUCS:
-                total_counts[ch] += 1
-
-    # Ensure all four nucleotides are present so the mapping is deterministic
+            u = ch.upper()
+            if u in NUCS:
+                total[u] += 1
     for n in NUCS:
-        total_counts.setdefault(n, 0)
-
-    # Sort by frequency desc, then alphabetically
-    sorted_nucs = sorted(NUCS, key=lambda n: (-total_counts[n], n))
-
+        total.setdefault(n, 0)
+    order = sorted(NUCS, key=lambda n: (-total[n], n))
     mapping: Dict[str, int] = {}
-    for nuc, weight in zip(sorted_nucs, WEIGHTS):
-        mapping[nuc] = WEIGHT_TO_CODE[weight]
-
+    for nuc, w in zip(order, WEIGHTS):
+        mapping[nuc] = WEIGHT_TO_CODE[w]
     return mapping
 
 
-def compute_column_mappings(
-    alignment: Dict[str, str], nchar: int
-) -> List[Dict[str, int]]:
-    """
-    For each column j:
-        - count A/C/G/T in that column (ignoring '?' and '-'),
-        - sort by decreasing frequency (ties alphabetically),
-        - assign weights 1,2,4,8 and map to 0–3.
-
-    Returns list of length nchar, where each element is a dict nuc->code.
-    """
-    col_counts: List[Counter] = [Counter() for _ in range(nchar)]
-
-    for seq in alignment.values():
+def compute_column_mappings(aln: Alignment) -> List[Dict[str, int]]:
+    col_counts = [Counter() for _ in range(aln.nchar)]
+    for seq in aln.seqs.values():
         for j, ch in enumerate(seq):
-            ch = ch.upper()
-            if ch in NUCS:
-                col_counts[j][ch] += 1
+            u = ch.upper()
+            if u in NUCS:
+                col_counts[j][u] += 1
 
-    col_mappings: List[Dict[str, int]] = []
-
-    for j in range(nchar):
-        counts = col_counts[j]
-
+    col_maps: List[Dict[str, int]] = []
+    for c in col_counts:
         for n in NUCS:
-            counts.setdefault(n, 0)
-
-        sorted_nucs = sorted(NUCS, key=lambda n: (-counts[n], n))
-
+            c.setdefault(n, 0)
+        order = sorted(NUCS, key=lambda n: (-c[n], n))
         mapping: Dict[str, int] = {}
-        for nuc, weight in zip(sorted_nucs, WEIGHTS):
-            mapping[nuc] = WEIGHT_TO_CODE[weight]
-
-        col_mappings.append(mapping)
-
-    return col_mappings
+        for nuc, w in zip(order, WEIGHTS):
+            mapping[nuc] = WEIGHT_TO_CODE[w]
+        col_maps.append(mapping)
+    return col_maps
 
 
-def encode_alignment_global(
-    alignment: Dict[str, str], mapping: Dict[str, int]
-) -> Dict[str, str]:
-    """
-    Apply a single global mapping nuc->code to every position.
-    '?' and '-' are left as-is; unknown symbols become '?'.
-    """
-    encoded: Dict[str, str] = {}
-
-    for taxon, seq in alignment.items():
-        out_chars: List[str] = []
+def encode_global(aln: Alignment, mapping: Dict[str, int]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for t in aln.taxa:
+        seq = aln.seqs[t]
+        enc = []
         for ch in seq:
-            uch = ch.upper()
-            if uch in mapping:
-                out_chars.append(str(mapping[uch]))
+            u = ch.upper()
+            if u in mapping:
+                enc.append(str(mapping[u]))
             elif ch in ("?", "-"):
-                out_chars.append(ch)
+                enc.append(ch)
             else:
-                out_chars.append("?")
-        encoded[taxon] = "".join(out_chars)
+                enc.append("?")
+        out[t] = "".join(enc)
+    return out
 
-    return encoded
 
-
-def encode_alignment_columnwise(
-    alignment: Dict[str, str], col_mappings: List[Dict[str, int]]
-) -> Dict[str, str]:
-    """
-    Apply column-specific mappings.
-    col_mappings[j] is a dict nuc->code for column j.
-    '?' and '-' are left as-is; unknown symbols become '?'.
-    """
-    encoded: Dict[str, str] = {}
-    nchar = len(col_mappings)
-
-    for taxon, seq in alignment.items():
-        if len(seq) != nchar:
-            raise ValueError(
-                f"Column mapping length mismatch for {taxon}: "
-                f"expected {nchar}, got {len(seq)}"
-            )
-
-        out_chars: List[str] = []
+def encode_columnwise(aln: Alignment, col_maps: List[Dict[str, int]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for t in aln.taxa:
+        seq = aln.seqs[t]
+        enc = []
         for j, ch in enumerate(seq):
-            uch = ch.upper()
-            if uch in col_mappings[j]:
-                out_chars.append(str(col_mappings[j][uch]))
+            u = ch.upper()
+            if u in col_maps[j]:
+                enc.append(str(col_maps[j][u]))
             elif ch in ("?", "-"):
-                out_chars.append(ch)
+                enc.append(ch)
             else:
-                out_chars.append("?")
-        encoded[taxon] = "".join(out_chars)
+                enc.append("?")
+        out[t] = "".join(enc)
+    return out
 
-    return encoded
 
-
-def format_nexus_matrix(
+def format_nexus(
+    taxa: List[str],
     encoded: Dict[str, str],
+    nchar: int,
+    title_comment: Optional[str] = None,
+    include_header: bool = True,
     add_outgroup: bool = False,
     outgroup_name: str = "Out",
-    include_header: bool = True,
 ) -> str:
-    """
-    Return a NEXUS DATA block (plus ASSUMPTIONS) as a string.
-
-    If add_outgroup is True, append an 'Out' taxon coded as all zeros.
-    If include_header is True, add the '#NEXUS' line at the top.
-    """
-    taxa = list(encoded.keys())
-    nchar = len(next(iter(encoded.values())))
-    ntax = len(taxa)
+    ntax = len(taxa) + (1 if add_outgroup else 0)
+    pad = max([len(t) for t in taxa] + ([len(outgroup_name)] if add_outgroup else [0])) + 2
 
     lines: List[str] = []
     if include_header:
         lines.append("#NEXUS")
+    if title_comment:
+        lines.append(f"[{title_comment}]")
+
     lines.append("BEGIN DATA;")
-    lines.append(
-        f"    DIMENSIONS NTAX={ntax + (1 if add_outgroup else 0)} "
-        f"NCHAR={nchar};"
-    )
-    lines.append(
-        '    FORMAT DATATYPE=STANDARD MISSING=? GAP=- SYMBOLS="0123";'
-    )
+    lines.append(f"    DIMENSIONS NTAX={ntax} NCHAR={nchar};")
+    lines.append('    FORMAT DATATYPE=STANDARD MISSING=? GAP=- SYMBOLS="0123";')
     lines.append("    MATRIX")
 
-    max_name_len = max(len(t) for t in taxa + ([outgroup_name] if add_outgroup else []))
-    name_field = max_name_len + 2
-
     for t in taxa:
-        seq = encoded[t]
-        lines.append(f"    {t.ljust(name_field)}{seq}")
-
+        lines.append(f"    {t.ljust(pad)}{encoded[t]}")
     if add_outgroup:
-        lines.append(f"    {outgroup_name.ljust(name_field)}" + ("0" * nchar))
+        lines.append(f"    {outgroup_name.ljust(pad)}" + ("0" * nchar))
 
     lines.append("    ;")
     lines.append("END;")
     lines.append("")
     lines.append("BEGIN ASSUMPTIONS;")
-    lines.append(f"\tTYPESET * UNTITLED   =  ord:  1- {nchar};")
+    lines.append(f"    TYPESET * UNTITLED = ord: 1-{nchar};")
     lines.append("END;")
 
     return "\n".join(lines)
 
 
+def write_text(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "FRECode: recode nucleotide alignments into 0–3 NEXUS matrices "
-            "using global or column-wise frequency-based mappings."
-        )
-    )
-    parser.add_argument("input", help="Path to input alignment text file.")
-    parser.add_argument(
-        "--mode",
-        choices=["global", "column", "both"],
-        default="global",
-        help=(
-            "Recoding mode:\n"
-            "  global  – use a single mapping for all sites.\n"
-            "  column  – compute mapping independently for each column.\n"
-            "  both    – output both global and column-wise recodings."
-        ),
-    )
-    parser.add_argument(
-        "--add-outgroup",
-        action="store_true",
-        help="If set, add an 'Out' taxon with all zeros.",
-    )
+    p = argparse.ArgumentParser(description="FRECode: frequency-based recoder (PHYLIP/TXT -> NEXUS).")
+    p.add_argument("input", help="Input alignment (.phy/.phylip or simple txt format).")
+    p.add_argument("--mode", choices=["global", "column", "both"], default="column",
+                   help="Recoding mode: global | column | both (default: column).")
+    p.add_argument("--add-outgroup", action="store_true", help="Append an all-zero outgroup named 'Out'.")
+    p.add_argument("--out-prefix", default=None,
+                   help="Output file prefix (default: derived from input filename).")
+    p.add_argument("--zip", dest="zip_path", default=None,
+                   help="If set, write outputs to files and package into this ZIP.")
+    args = p.parse_args()
 
-    args = parser.parse_args()
+    in_path = Path(args.input)
+    if not in_path.exists():
+        raise SystemExit(f"Input file not found: {in_path}")
 
-    alignment, ntax, nchar = parse_alignment(args.input)
+    aln = read_alignment_auto(in_path)
+
+    prefix = args.out_prefix or in_path.stem
+    out_files: List[Path] = []
+
+    def emit(name_suffix: str, nexus_text: str) -> None:
+        nonlocal out_files
+        if args.zip_path:
+            out_path = Path(f"{prefix}_{name_suffix}.nex")
+            # write next to current working dir
+            write_text(out_path, nexus_text)
+            out_files.append(out_path)
+        else:
+            # stdout
+            print(nexus_text)
 
     if args.mode == "global":
-        mapping = compute_global_mapping(alignment)
-        encoded = encode_alignment_global(alignment, mapping)
-        nexus_text = format_nexus_matrix(
-            encoded,
-            add_outgroup=args.add_outgroup,
+        gmap = compute_global_mapping(aln)
+        enc = encode_global(aln, gmap)
+        nexus = format_nexus(
+            taxa=aln.taxa,
+            encoded=enc,
+            nchar=aln.nchar,
+            title_comment="FRECode GLOBAL recoding",
             include_header=True,
+            add_outgroup=args.add_outgroup,
         )
-        print(nexus_text)
+        emit("global", nexus)
 
     elif args.mode == "column":
-        col_mappings = compute_column_mappings(alignment, nchar)
-        encoded = encode_alignment_columnwise(alignment, col_mappings)
-        nexus_text = format_nexus_matrix(
-            encoded,
-            add_outgroup=args.add_outgroup,
+        cmaps = compute_column_mappings(aln)
+        enc = encode_columnwise(aln, cmaps)
+        nexus = format_nexus(
+            taxa=aln.taxa,
+            encoded=enc,
+            nchar=aln.nchar,
+            title_comment="FRECode COLUMN-WISE recoding",
             include_header=True,
-        )
-        print(nexus_text)
-
-    elif args.mode == "both":
-        # Global recoding
-        mapping = compute_global_mapping(alignment)
-        encoded_global = encode_alignment_global(alignment, mapping)
-        nexus_global = format_nexus_matrix(
-            encoded_global,
             add_outgroup=args.add_outgroup,
+        )
+        emit("column", nexus)
+
+    else:  # both
+        gmap = compute_global_mapping(aln)
+        enc_g = encode_global(aln, gmap)
+        nexus_g = format_nexus(
+            taxa=aln.taxa,
+            encoded=enc_g,
+            nchar=aln.nchar,
+            title_comment="FRECode GLOBAL recoding",
             include_header=True,
-        )
-
-        # Column-wise recoding
-        col_mappings = compute_column_mappings(alignment, nchar)
-        encoded_col = encode_alignment_columnwise(alignment, col_mappings)
-        # No second #NEXUS header
-        nexus_col = format_nexus_matrix(
-            encoded_col,
             add_outgroup=args.add_outgroup,
-            include_header=False,
         )
 
-        # Output both blocks, separated by NEXUS comments
-        print("[FRECode GLOBAL recoding]")
-        print(nexus_global)
-        print("")
-        print("[FRECode COLUMN-WISE recoding]")
-        print(nexus_col)
+        cmaps = compute_column_mappings(aln)
+        enc_c = encode_columnwise(aln, cmaps)
+        nexus_c = format_nexus(
+            taxa=aln.taxa,
+            encoded=enc_c,
+            nchar=aln.nchar,
+            title_comment="FRECode COLUMN-WISE recoding",
+            include_header=False,  # no second #NEXUS
+            add_outgroup=args.add_outgroup,
+        )
+
+        if args.zip_path:
+            emit("global", nexus_g)
+            emit("column", nexus_c)
+        else:
+            # stdout: print both blocks in one stream
+            print(nexus_g)
+            print("")
+            print(nexus_c)
+
+    # ZIP packaging (if requested)
+    if args.zip_path:
+        zip_path = Path(args.zip_path)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in out_files:
+                z.write(f, arcname=f.name)
+
+        # Optional: clean up loose files after zipping
+        # Comment out the next two lines if you want to keep the .nex files.
+        for f in out_files:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+        print(f"Wrote ZIP: {zip_path.resolve()}")
 
 
 if __name__ == "__main__":
